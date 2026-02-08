@@ -1,40 +1,312 @@
 <!doctype html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
-  <title>Flappy (Mobile)</title>
+  <title>3D Flappy + Sound</title>
   <style>
-    html, body { margin:0; padding:0; height:100%; background:#0b1220; overflow:hidden; touch-action:manipulation; }
-    canvas { display:block; width:100vw; height:100vh; }
-    /* Safe-area padding for notches */
-    .hint {
-      position: fixed; left: 50%; top: env(safe-area-inset-top, 0px);
-      transform: translateX(-50%);
-      color: rgba(255,255,255,.9);
-      font: 600 14px system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      padding: 10px 12px; border-radius: 999px;
-      background: rgba(0,0,0,.25);
-      backdrop-filter: blur(8px);
-      margin-top: 10px;
-      user-select: none;
-      pointer-events: none;
-      white-space: nowrap;
+    html,body{margin:0;height:100%;overflow:hidden;background:#050816}
+    canvas{display:block}
+    .ui{
+      position:fixed;left:12px;top:12px;z-index:5;
+      font:600 14px system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      color:rgba(255,255,255,.9);
+      background:rgba(0,0,0,.35);backdrop-filter:blur(10px);
+      padding:10px 12px;border-radius:14px;user-select:none;
+    }
+    .ui b{font-size:16px}
+    .btn{
+      position:fixed;right:12px;top:12px;z-index:6;
+      font:700 14px system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      color:rgba(255,255,255,.95);
+      background:rgba(0,0,0,.35);backdrop-filter:blur(10px);
+      padding:10px 12px;border-radius:14px;border:0;
     }
   </style>
 </head>
 <body>
-  <canvas id="c"></canvas>
-  <div class="hint" id="hint">Tap to jump • Double tap to restart</div>
+  <div class="ui"><b>3D Flappy</b><div id="s">Tap to start</div></div>
+  <button class="btn" id="muteBtn">🔊 Sound</button>
 
-<script>
-(() => {
-  const canvas = document.getElementById("c");
-  const ctx = canvas.getContext("2d");
-  const hint = document.getElementById("hint");
+  <!-- Three.js CDN -->
+  <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
 
-  // HiDPI scaling
-  function resize() {
+  <script>
+  (() => {
+    // ---------- Basic setup ----------
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x050816, 5, 30);
+
+    const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 100);
+    camera.position.set(0, 2.4, 6);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+    document.body.appendChild(renderer.domElement);
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(4, 8, 6);
+    scene.add(dir);
+
+    // Ground plane
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(200, 200),
+      new THREE.MeshStandardMaterial({ color: 0x0b1020, roughness: 1 })
+    );
+    ground.rotation.x = -Math.PI/2;
+    ground.position.y = -2.2;
+    scene.add(ground);
+
+    // Stars
+    const starGeo = new THREE.BufferGeometry();
+    const starCount = 700;
+    const starPos = new Float32Array(starCount*3);
+    for (let i=0;i<starCount;i++){
+      starPos[i*3+0] = (Math.random()-0.5)*80;
+      starPos[i*3+1] = (Math.random()-0.1)*40;
+      starPos[i*3+2] = -Math.random()*120;
+    }
+    starGeo.setAttribute("position", new THREE.BufferAttribute(starPos, 3));
+    const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ size:0.05, color:0xffffff }));
+    scene.add(stars);
+
+    // Player (bird) = sphere
+    const bird = new THREE.Mesh(
+      new THREE.SphereGeometry(0.22, 24, 24),
+      new THREE.MeshStandardMaterial({ color: 0xfbbf24, roughness: 0.35, metalness: 0.05 })
+    );
+    bird.position.set(0, 0, 0);
+    scene.add(bird);
+
+    // ---------- Game values ----------
+    let running = false;
+    let dead = false;
+    let score = 0;
+    let best = Number(localStorage.getItem("best_3d_flappy") || 0);
+
+    let vy = 0;
+    const GRAV = 10.5;
+    const JUMP = 4.3;
+
+    // Obstacles: two boxes with a gap
+    const obstacles = [];
+    const OB_SPEED = 6.5;
+    const SPAWN_Z = -18;
+    const DESPAWN_Z = 8;
+    const GAP = 1.5;
+    const OB_W = 1.2;
+    const OB_D = 1.2;
+
+    let spawnTimer = 0;
+
+    const sEl = document.getElementById("s");
+    function ui() {
+      if (!running && !dead) sEl.textContent = `Tap to start • Best ${best}`;
+      if (running) sEl.textContent = `Score ${score} • Best ${best}`;
+      if (dead) sEl.textContent = `Game Over • Score ${score} • Tap to restart`;
+    }
+
+    function reset() {
+      running = false; dead = false;
+      score = 0; vy = 0;
+      bird.position.set(0, 0, 0);
+      spawnTimer = 0;
+
+      // remove old obstacles
+      while (obstacles.length) {
+        const o = obstacles.pop();
+        scene.remove(o.top, o.bot);
+      }
+      ui();
+    }
+
+    function makeObstacle() {
+      const centerY = (Math.random()*2.0 - 1.0) * 0.9; // -0.9..0.9
+      const topH = 5; // tall; we just place it
+      const mat = new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.7 });
+
+      const top = new THREE.Mesh(new THREE.BoxGeometry(OB_W, topH, OB_D), mat);
+      const bot = new THREE.Mesh(new THREE.BoxGeometry(OB_W, topH, OB_D), mat);
+
+      top.position.set((Math.random()*2-1)*0.9, centerY + GAP/2 + topH/2, SPAWN_Z);
+      bot.position.set((Math.random()*2-1)*0.9, centerY - GAP/2 - topH/2, SPAWN_Z);
+
+      scene.add(top, bot);
+      obstacles.push({ top, bot, scored:false });
+    }
+
+    // ---------- “3D sound” (spatial) ----------
+    let audioCtx = null;
+    let muted = false;
+
+    const muteBtn = document.getElementById("muteBtn");
+    muteBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      muted = !muted;
+      muteBtn.textContent = muted ? "🔇 Muted" : "🔊 Sound";
+    }, { passive:false });
+
+    function initAudio() {
+      if (audioCtx) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AC();
+    }
+
+    function playBeep({ freq=600, dur=0.09, pan=0 }) {
+      if (!audioCtx || muted) return;
+
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      const p = audioCtx.createStereoPanner();
+
+      o.type = "sine";
+      o.frequency.value = freq;
+
+      // quick envelope
+      const t = audioCtx.currentTime;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      // pan = -1 left, +1 right
+      p.pan.value = Math.max(-1, Math.min(1, pan));
+
+      o.connect(g).connect(p).connect(audioCtx.destination);
+      o.start();
+      o.stop(t + dur + 0.02);
+    }
+
+    function soundJump() {
+      // pan based on bird x position (spatial feel)
+      playBeep({ freq: 680, dur: 0.08, pan: bird.position.x / 2 });
+    }
+    function soundCrash() {
+      playBeep({ freq: 180, dur: 0.18, pan: 0 });
+      setTimeout(() => playBeep({ freq: 120, dur: 0.22, pan: 0 }), 60);
+    }
+    function soundScore() {
+      playBeep({ freq: 900, dur: 0.06, pan: 0.2 });
+    }
+
+    // ---------- Input ----------
+    function tap() {
+      initAudio();
+
+      if (dead) { reset(); return; }
+      if (!running) { running = true; ui(); }
+
+      vy = JUMP;
+      soundJump();
+    }
+
+    addEventListener("pointerdown", (e) => { e.preventDefault(); tap(); }, { passive:false });
+    addEventListener("keydown", (e) => {
+      if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); tap(); }
+      if (e.code === "KeyR") reset();
+    });
+
+    // ---------- Collision helper (AABB-ish sphere vs box) ----------
+    function sphereBoxCollide(sx, sy, sz, r, box) {
+      const b = new THREE.Box3().setFromObject(box);
+      const cx = Math.max(b.min.x, Math.min(sx, b.max.x));
+      const cy = Math.max(b.min.y, Math.min(sy, b.max.y));
+      const cz = Math.max(b.min.z, Math.min(sz, b.max.z));
+      const dx = sx - cx, dy = sy - cy, dz = sz - cz;
+      return (dx*dx + dy*dy + dz*dz) <= r*r;
+    }
+
+    function die() {
+      if (dead) return;
+      dead = true;
+      running = false;
+      best = Math.max(best, score);
+      localStorage.setItem("best_3d_flappy", String(best));
+      soundCrash();
+      ui();
+    }
+
+    // ---------- Loop ----------
+    let last = performance.now();
+    function loop(now) {
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
+
+      // move stars slowly
+      stars.position.z += dt * 2.2;
+      if (stars.position.z > 30) stars.position.z = 0;
+
+      if (running && !dead) {
+        // physics
+        vy -= GRAV * dt;
+        bird.position.y += vy * dt;
+
+        // tilt for vibe
+        bird.rotation.z = THREE.MathUtils.lerp(bird.rotation.z, -vy * 0.08, 0.12);
+
+        // bounds
+        if (bird.position.y < -1.9) { bird.position.y = -1.9; die(); }
+        if (bird.position.y > 2.3) { bird.position.y = 2.3; vy = 0; }
+
+        // spawn obstacles
+        spawnTimer += dt;
+        if (spawnTimer >= 1.05) { spawnTimer = 0; makeObstacle(); }
+
+        // move obstacles toward camera
+        for (const o of obstacles) {
+          o.top.position.z += OB_SPEED * dt;
+          o.bot.position.z += OB_SPEED * dt;
+
+          // score when passed z=0
+          if (!o.scored && o.top.position.z > bird.position.z) {
+            o.scored = true;
+            score++;
+            soundScore();
+            ui();
+          }
+
+          // collision
+          const r = 0.22;
+          if (
+            sphereBoxCollide(bird.position.x, bird.position.y, bird.position.z, r, o.top) ||
+            sphereBoxCollide(bird.position.x, bird.position.y, bird.position.z, r, o.bot)
+          ) {
+            die();
+          }
+        }
+
+        // remove passed obstacles
+        for (let i=obstacles.length-1;i>=0;i--) {
+          const o = obstacles[i];
+          if (o.top.position.z > DESPAWN_Z) {
+            scene.remove(o.top, o.bot);
+            obstacles.splice(i, 1);
+          }
+        }
+
+        // camera follow
+        camera.position.y = THREE.MathUtils.lerp(camera.position.y, bird.position.y + 2.2, 0.08);
+        camera.lookAt(0, bird.position.y, 0);
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(loop);
+    }
+
+    reset();
+    requestAnimationFrame(loop);
+  })();
+  </script>
+</body>
+</html>  function resize() {
     const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
     canvas.width = Math.floor(window.innerWidth * dpr);
     canvas.height = Math.floor(window.innerHeight * dpr);
